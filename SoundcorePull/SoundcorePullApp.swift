@@ -3,7 +3,10 @@ import SwiftUI
 
 @main
 struct SoundcorePullApp: App {
-    @State private var syncer = Syncer(library: .iCloud)
+    @State private var syncer = Syncer(
+        library: .iCloud,
+        startAutomatically: ProcessInfo.processInfo.environment["SOUNDCORE_PULL_TESTING"] != "1"
+    )
 
     var body: some Scene {
         WindowGroup {
@@ -22,7 +25,7 @@ struct SoundcorePullApp: App {
             }
         }
         Settings {
-            SettingsView()
+            SettingsView(syncer: syncer)
         }
     }
 

@@ -65,3 +65,29 @@ For interoperability with hardware you own.
 ## Licence
 
 MIT. See [LICENSE](LICENSE). The ported recording-bean-web code is MIT too; see Credits.
+
+### Recorder pairing
+
+On the first connection, Soundcore Pull reads the recorder's device information and
+saves its serial number in this Mac's UserDefaults **before** requesting any
+recording list or starting a download. Keep only your intended recorder awake and
+nearby for this initial pairing. Each later connection must report the same serial;
+a different or invalid identity is disconnected without listing, downloading, or
+deleting recordings. Rejected Bluetooth identifiers are skipped until the app
+restarts or the pairing is forgotten, so another nearby recorder cannot monopolize
+scanning. The serial remains the identity check on every accepted connection.
+
+Settings shows **Paired Recorder** and its serial. **Forget Recorder…** confirms
+that syncing will stop and the next compatible recorder found will be paired
+automatically. Forgetting cancels the active connection, clears queued deletions,
+and revokes any in-flight transfer before it can save. Existing iCloud files and
+launch-at-login settings are kept. Pairing uses the recorder-reported serial; it
+is not cryptographic device authentication.
+
+`./scripts/test.sh` covers pairing persistence, reconnects, rejected/invalid
+identities, and forgetting during device info and transfer responses using a fake
+transport and isolated UserDefaults. The test scheme disables background syncing
+so unit tests do not connect to a physical recorder. To check with hardware, pair
+your recorder alone, restart with only a different recorder awake, then wake the
+paired recorder and verify syncing resumes. Also check Forget Recorder during a
+transfer and confirm Settings displays the newly paired serial afterwards.

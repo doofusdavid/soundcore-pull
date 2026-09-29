@@ -24,7 +24,9 @@ enum RecorderError: Error, CustomStringConvertible {
 
 /// Blocking CoreBluetooth session with one recorder. The CLI is sequential, so every call
 /// blocks the calling thread while delegate callbacks arrive on a private queue.
-final class Recorder: NSObject {
+final class Recorder: NSObject, RecorderTransport {
+    private let excludedIdentifiers: Set<UUID>
+    var identifier: UUID? { peripheral?.identifier }
     static let serviceUUID = CBUUID(string: "020cf5da-0000-1000-8000-00805f9b34fb")
     static let writeUUID = CBUUID(string: "00007777-0000-1000-8000-00805f9b34fb")
     static let notifyUUID = CBUUID(string: "00008888-0000-1000-8000-00805f9b34fb")
@@ -43,7 +45,8 @@ final class Recorder: NSObject {
 
     var name: String { peripheral?.name ?? "soundcore Work" }
 
-    override init() {
+    init(excluding identifiers: Set<UUID> = []) {
+        excludedIdentifiers = identifiers
         super.init()
         central = CBCentralManager(delegate: self, queue: queue)
     }
@@ -52,9 +55,11 @@ final class Recorder: NSObject {
         guard step.wait(timeout: .now() + 5) == .success else { throw RecorderError.bluetoothOff(central.state) }
         guard central.state == .poweredOn else { throw RecorderError.bluetoothOff(central.state) }
 
+        guard !frames.withLock({ disconnected }) else { throw RecorderError.notConnected }
         central.scanForPeripherals(withServices: [Self.serviceUUID])
         let found = step.wait(timeout: .now() + scanTimeout) == .success
         central.stopScan()
+        guard !frames.withLock({ disconnected }) else { throw RecorderError.notConnected }
         guard found, let peripheral else { throw RecorderError.notFound }
 
         central.connect(peripheral)
@@ -66,11 +71,18 @@ final class Recorder: NSObject {
     }
 
     func disconnect() {
+        frames.lock()
+        disconnected = true
+        pending.removeAll()
+        frames.broadcast()
+        frames.unlock()
+        central.stopScan()
+        step.signal()
         if let peripheral { central.cancelPeripheralConnection(peripheral) }
     }
 
     func send(_ frame: Data) throws {
-        guard let peripheral, let writeCharacteristic else { throw RecorderError.notConnected }
+        guard !frames.withLock({ disconnected }), let peripheral, let writeCharacteristic else { throw RecorderError.notConnected }
         let type: CBCharacteristicWriteType = writeCharacteristic.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
         peripheral.writeValue(frame, for: writeCharacteristic, type: type)
     }
@@ -87,17 +99,9 @@ final class Recorder: NSObject {
         return pending.removeFirst()
     }
 
-    /// Send a command and return the first reply with the given type and id, skipping unrelated pushes.
-    func request(_ frame: Data, type: UInt8, id: UInt8, timeout: TimeInterval, _ what: String) throws -> Frame {
-        try send(frame)
-        while true {
-            let reply = try next(timeout: timeout, waitingFor: what)
-            if reply.type == type && reply.id == id { return reply }
-        }
-    }
-
     private func waitStep(_ what: String) throws {
         guard step.wait(timeout: .now() + 10) == .success else { throw RecorderError.timeout(what) }
+        guard !frames.withLock({ disconnected }) else { throw RecorderError.notConnected }
         if let stepError { throw RecorderError.connectFailed("\(what): \(stepError)") }
     }
 
@@ -113,7 +117,7 @@ extension Recorder: CBCentralManagerDelegate, CBPeripheralDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
-        guard self.peripheral == nil else { return }
+        guard self.peripheral == nil, !excludedIdentifiers.contains(peripheral.identifier) else { return }
         self.peripheral = peripheral
         peripheral.delegate = self
         step.signal()

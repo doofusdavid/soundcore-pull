@@ -22,10 +22,14 @@ final class Syncer {
 
     let library: Library
     private let pendingDeletes = PendingDeletes()
+    private let pairing = RecorderPairing()
+    private(set) var pairedSerial: String?
 
-    init(library: Library) {
+    init(library: Library, startAutomatically: Bool = true) {
         self.library = library
+        pairedSerial = pairing.serial
         downloaded = library.downloadedIds()
+        guard startAutomatically else { return }
         try? FileManager.default.createDirectory(at: library.folder, withIntermediateDirectories: true)
         let thread = Thread { [self] in runForever() }
         thread.name = "soundcore-pull.sync"
@@ -33,38 +37,64 @@ final class Syncer {
     }
 
     func deleteFromRecorder(_ fileId: UInt32) {
+        guard deviceInfo != nil, recordings.contains(where: { $0.fileId == fileId }),
+              downloaded.contains(fileId) else { return }
         pendingDeletes.append(fileId)
+    }
+
+    func forgetRecorder() {
+        pairing.forget()
+        _ = pendingDeletes.drain()
+        pairedSerial = nil
+        deviceInfo = nil
+        recordings = []
+        phase = .scanning
     }
 
     // MARK: background loop
 
-    private nonisolated func post(_ change: @escaping @MainActor (Syncer) -> Void) {
-        Task { @MainActor in change(self) }
+    private nonisolated func post(_ generation: UUID, _ change: @escaping @MainActor (Syncer) -> Void) {
+        Task { @MainActor in
+            guard self.pairing.currentGeneration == generation else { return }
+            change(self)
+        }
     }
 
     private nonisolated func runForever() {
         while true {
-            post { $0.phase = .scanning }
-            let recorder = Recorder()
+            let recorder = Recorder(excluding: pairing.rejectedIdentifiers)
+            let generation = pairing.begin { recorder.disconnect() }
+            post(generation) { $0.phase = .scanning; $0.deviceInfo = nil; $0.recordings = [] }
+            _ = pendingDeletes.drain()
             do {
                 try recorder.connect(scanTimeout: 30)
-                try session(recorder)
+                let paired = try PairedRecorder(recorder, pairing: pairing, generation: generation)
+                try session(paired)
+            } catch PairingError.differentRecorder {
+                log.notice("Skipping recorder: serial does not match the paired recorder")
+                pairing.reject(recorder.identifier, generation: generation)
+            } catch PairingError.invalidDeviceInfo {
+                log.error("Skipping recorder: invalid device-info reply")
+                pairing.reject(recorder.identifier, generation: generation)
+            } catch PairingError.forgotten {
+                // Settings revoked this session; restart with a fresh handshake.
             } catch RecorderError.notFound {
                 // recorder asleep; scan again
             } catch {
-                post { $0.phase = .failed("\(error)") }
+                post(generation) { $0.phase = .failed("\(error)") }
                 Thread.sleep(forTimeInterval: 3)
             }
             recorder.disconnect()
         }
     }
 
-    private nonisolated func session(_ recorder: Recorder) throws {
+    private nonisolated func session(_ recorder: PairedRecorder) throws {
         let crypto = DeviceCrypto()
-        let infoReply = try recorder.request(Frames.getDeviceInfo(), type: 0x01, id: 0x01, timeout: 8, "device info")
-        let info = DeviceInfo.parse(infoReply.payload)
-        log.notice("device info: \(infoReply.hex, privacy: .public)")
-        post { $0.deviceInfo = info; $0.phase = .connected }
+        post(recorder.generation) {
+            $0.deviceInfo = recorder.info
+            $0.pairedSerial = recorder.info.serial
+            $0.phase = .connected
+        }
 
         // The recorder stamps each recording's id with its own clock, so keep it in step with ours.
         let clockReply = try recorder.request(Frames.syncTime(), type: 0x01, id: 0xA6, timeout: 8, "clock sync")
@@ -72,23 +102,24 @@ final class Syncer {
 
         while true {
             let entries = try fetchRecordings(recorder)
-            post { $0.recordings = entries }
+            post(recorder.generation) { $0.recordings = entries }
             let have = library.downloadedIds()
             for entry in entries where !have.contains(entry.fileId) {
                 try pull(entry, recorder: recorder, crypto: crypto)
             }
             for fileId in pendingDeletes.drain() {
                 let reply = try recorder.request(Frames.deleteFile(fileId: fileId), type: 0x1A, id: 0x10, timeout: 10, "delete")
-                if reply.status == 0 { post { $0.recordings.removeAll { $0.fileId == fileId } } }
+                if reply.status == 0 { post(recorder.generation) { $0.recordings.removeAll { $0.fileId == fileId } } }
             }
-            post { $0.phase = .connected }
+            post(recorder.generation) { $0.phase = .connected }
             for _ in 0..<15 where pendingDeletes.isEmpty {
+                try recorder.authorized {}
                 Thread.sleep(forTimeInterval: 1)
             }
         }
     }
 
-    private nonisolated func fetchRecordings(_ recorder: Recorder) throws -> [RecordingEntry] {
+    private nonisolated func fetchRecordings(_ recorder: PairedRecorder) throws -> [RecordingEntry] {
         var entries: [UInt32: RecordingEntry] = [:]
         for page in UInt16(0)..<50 {
             let reply = try recorder.request(Frames.listFiles(page: page), type: 0x1A, id: 0x0E, timeout: 8, "recording list")
@@ -101,13 +132,13 @@ final class Syncer {
         return entries.values.sorted { $0.fileId > $1.fileId }
     }
 
-    private nonisolated func pull(_ entry: RecordingEntry, recorder: Recorder, crypto: DeviceCrypto) throws {
+    private nonisolated func pull(_ entry: RecordingEntry, recorder: PairedRecorder, crypto: DeviceCrypto) throws {
         if !crypto.hasSession {
             let reply = try recorder.request(Frames.handshake(publicKey: crypto.publicKey), type: 0x2E, id: 0x01, timeout: 12, "encryption handshake")
             try crypto.completeHandshake(reply.payload)
         }
         defer { crypto.clearFile(entry.fileId) }
-        post { $0.phase = .pulling(fileId: entry.fileId, progress: 0) }
+        post(recorder.generation) { $0.phase = .pulling(fileId: entry.fileId, progress: 0) }
 
         var audio = Data()
         var expected = Int(entry.sizeBytes)
@@ -136,12 +167,13 @@ final class Syncer {
                 }
                 if chunks % 25 == 0 {
                     let progress = expected > 0 ? min(1, Double(audio.count) / Double(expected)) : 0
-                    post { $0.phase = .pulling(fileId: entry.fileId, progress: progress) }
+                    post(recorder.generation) { $0.phase = .pulling(fileId: entry.fileId, progress: progress) }
                 }
             case 0x0A:
                 guard !audio.isEmpty else { throw CryptoError.badFileKey }
-                try library.save(OggOpus.mux(audio), for: entry)
-                post { $0.downloaded.insert(entry.fileId) }
+                let ogg = OggOpus.mux(audio)
+                try recorder.authorized { try library.save(ogg, for: entry) }
+                post(recorder.generation) { $0.downloaded.insert(entry.fileId) }
                 return
             default:
                 continue

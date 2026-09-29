@@ -51,5 +51,7 @@ schemes:
       config: Debug
     test:
       config: Debug
+      environmentVariables:
+        SOUNDCORE_PULL_TESTING: "1"
       targets:
         - SoundcorePullTests
