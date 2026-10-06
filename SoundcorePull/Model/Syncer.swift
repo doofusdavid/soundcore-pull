@@ -17,6 +17,7 @@ final class Syncer {
     private(set) var deviceInfo: DeviceInfo?
     private(set) var recordings: [RecordingEntry] = []
     private(set) var downloaded: Set<UInt32>
+    private(set) var conversionIssue: String?
 
     var rows: [RecordingRow] { RecordingRow.merge(onRecorder: recordings, downloaded: downloaded) }
 
@@ -30,6 +31,9 @@ final class Syncer {
         let thread = Thread { [self] in runForever() }
         thread.name = "soundcore-pull.sync"
         thread.start()
+        let conversionThread = Thread { [self] in convertForever() }
+        conversionThread.name = "soundcore-pull.m4a"
+        conversionThread.start()
     }
 
     func deleteFromRecorder(_ fileId: UInt32) {
@@ -56,6 +60,19 @@ final class Syncer {
                 Thread.sleep(forTimeInterval: 3)
             }
             recorder.disconnect()
+        }
+    }
+
+    private nonisolated func convertForever() {
+        let converter = M4AConverter(library: library)
+        while true {
+            do {
+                let issue = try converter.convertPending()
+                post { $0.conversionIssue = issue }
+            } catch {
+                post { $0.conversionIssue = error.localizedDescription }
+            }
+            Thread.sleep(forTimeInterval: 15)
         }
     }
 

@@ -57,6 +57,12 @@ struct ContentView: View {
             } else if let info = syncer.deviceInfo, syncer.phase != .scanning {
                 Text(deviceText(info)).foregroundStyle(.secondary)
             }
+            if let issue = syncer.conversionIssue {
+                Text("M4A conversion: \(issue)")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .textSelection(.enabled)
+            }
         }
     }
 
